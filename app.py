@@ -3,12 +3,13 @@ Banenplan Service — extraheert kamervormen uit PDF en genereert SVG banenplann
 Deploy op Railway, Render of Fly.io. Wordt aangeroepen vanuit n8n via HTTP Request node.
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import fitz  # PyMuPDF
 import base64
 import math
 import json
 import re
+from weasyprint import HTML as WeasyHTML
 
 app = Flask(__name__)
 
@@ -491,8 +492,6 @@ def banenplan():
     app._last_html = html  # tijdelijk in memory voor /banenplan/html
 
     # Converteer naar PDF
-    from flask import Response
-    from weasyprint import HTML as WeasyHTML
     pdf_bytes = WeasyHTML(string=html).write_pdf()
 
     return Response(
