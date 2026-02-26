@@ -445,9 +445,18 @@ def banenplan():
       "html_rapport": "<html>...</html>"
     }
     """
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'JSON body vereist'}), 400
+    import json as json_module
+
+    data = request.get_json(force=True, silent=True)
+
+    # n8n stuurt soms dubbel-gecodeerde JSON — parse opnieuw als het een string is
+    if isinstance(data, str):
+        data = json_module.loads(data)
+
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Ongeldige JSON body', 'ontvangen_type': str(type(data))}), 400
+        if not data:
+            return jsonify({'error': 'JSON body vereist'}), 400
 
     # Haal polygonen uit PDF
     pdf_bytes = base64.b64decode(data['pdf_base64'])
