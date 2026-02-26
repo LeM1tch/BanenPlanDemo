@@ -1,2 +1,0 @@
-[phases.setup]
-nixPkgs = ["pango", "harfbuzz", "fontconfig", "freetype", "libffi", "cairo", "gdk-pixbuf"]
