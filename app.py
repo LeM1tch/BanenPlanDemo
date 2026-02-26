@@ -445,18 +445,9 @@ def banenplan():
       "html_rapport": "<html>...</html>"
     }
     """
-    import json as json_module
-
-    data = request.get_json(force=True, silent=True)
-
-    # n8n stuurt soms dubbel-gecodeerde JSON — parse opnieuw als het een string is
-    if isinstance(data, str):
-        data = json_module.loads(data)
-
-    if not data or not isinstance(data, dict):
-        return jsonify({'error': 'Ongeldige JSON body', 'ontvangen_type': str(type(data))}), 400
-        if not data:
-            return jsonify({'error': 'JSON body vereist'}), 400
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'JSON body vereist'}), 400
 
     # Haal polygonen uit PDF
     pdf_bytes = base64.b64decode(data['pdf_base64'])
@@ -497,11 +488,19 @@ def banenplan():
     # Genereer HTML rapport
     html = genereer_html_rapport(ruimtes, svgs)
 
+    # Converteer naar PDF
     from flask import Response
+    from weasyprint import HTML as WeasyHTML
+    pdf_bytes = WeasyHTML(string=html).write_pdf()
+
     return Response(
-        html,
-        mimetype='text/html',
-        headers={'Content-Disposition': 'attachment; filename="banenplan_rapport.html"'}
+        pdf_bytes,
+        mimetype='application/pdf',
+        headers={
+            'Content-Disposition': 'attachment; filename="banenplan_rapport.pdf"',
+            'X-Aantal-SVGs': str(len(svgs)),
+            'X-Gemist-Ruimtes': ','.join(gemiste_ruimtes)
+        }
     )
 
 
