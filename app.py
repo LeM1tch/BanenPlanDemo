@@ -497,12 +497,12 @@ def banenplan():
     # Genereer HTML rapport
     html = genereer_html_rapport(ruimtes, svgs)
 
-    return jsonify({
-        'svgs': svgs,
-        'html_rapport': html,
-        'aantalSVGs': len(svgs),
-        'gemistRuimtes': gemiste_ruimtes
-    })
+    from flask import Response
+    return Response(
+        html,
+        mimetype='text/html',
+        headers={'Content-Disposition': 'attachment; filename="banenplan_rapport.html"'}
+    )
 
 
 def genereer_html_rapport(ruimtes, svgs):
