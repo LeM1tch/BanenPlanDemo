@@ -487,6 +487,8 @@ def banenplan():
 
     # Genereer HTML rapport
     html = genereer_html_rapport(ruimtes, svgs)
+    # Sla HTML ook op als apart endpoint beschikbaar
+    app._last_html = html  # tijdelijk in memory voor /banenplan/html
 
     # Converteer naar PDF
     from flask import Response
@@ -498,11 +500,8 @@ def banenplan():
         mimetype='application/pdf',
         headers={
             'Content-Disposition': 'attachment; filename="banenplan_rapport.pdf"',
-            'X-Aantal-SVGs': str(len(svgs)),
-            'X-Gemist-Ruimtes': ','.join(gemiste_ruimtes)
         }
     )
-
 
 def genereer_html_rapport(ruimtes, svgs):
     """Bouwt volledig HTML rapport met SVG banenplannen en uittrekstaat."""
@@ -633,7 +632,46 @@ def genereer_html_rapport(ruimtes, svgs):
 </body></html>'''
 
     return html
+@app.route('/banenplan/html', methods=['POST'])
+def banenplan_html():
+    """Zelfde als /banenplan maar geeft HTML terug in plaats van PDF."""
+    data = request.get_json(force=True, silent=True)
+    if isinstance(data, str):
+        import json as json_module
+        data = json_module.loads(data)
 
+    pdf_b64 = data.get('pdf_base64', '')
+    if ',' in pdf_b64:
+        pdf_b64 = pdf_b64.split(',', 1)[1]
+
+    pdf_bytes = base64.b64decode(pdf_b64)
+    polygonen_map = extraheer_polygonen(pdf_bytes)
+    ruimtes = data.get('ruimtes', [])
+
+    svgs = {}
+    for r in ruimtes:
+        nr = r.get('ruimtenummer', '')
+        if nr in polygonen_map:
+            poly = polygonen_map[nr]
+            svg = genereer_banenplan_svg(
+                ruimtenummer=nr,
+                naam=r.get('naam', ''),
+                punten_m=poly['punten_m'],
+                vloertype=r.get('vloertype') or poly['vloertype'],
+                netto_m2=r.get('netto_m2', 0),
+                bruto_m2=r.get('bruto_m2', 0),
+                aantal_banen=r.get('aantal_banen', 0)
+            )
+            if svg:
+                svgs[nr] = svg
+
+    html = genereer_html_rapport(ruimtes, svgs)
+
+    return Response(
+        html,
+        mimetype='text/html',
+        headers={'Content-Disposition': 'attachment; filename="banenplan_rapport.html"'}
+    )
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
