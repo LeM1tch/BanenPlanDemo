@@ -286,7 +286,7 @@ def genereer_rapport_html(woningen, gemeenschappelijk, per_type, totalen):
               </td>
               <td style="text-align:center;font-weight:bold;padding:4px">{k.get("m2", "")}</td>
               <td style="text-align:center;color:#64748b;padding:4px;font-size:11px">
-                {k.get("lengte_m", "-")} × {k.get("breedte_m", "-")}
+                {k.get("lengte_m") or "-"} × {k.get("breedte_m") or "-"}
               </td>
             </tr>'''
 
