@@ -1,495 +1,471 @@
 """
-Banenplan Service — extraheert kamervormen uit PDF en genereert SVG banenplannen
-Deploy op Railway, Render of Fly.io. Wordt aangeroepen vanuit n8n via HTTP Request node.
+Woningbouw Plattegrond Extractie Service
+Genereert PDF rapporten met SVG plattegronden per woning.
+Deploy op Railway, Render of Fly.io. Wordt aangeroepen vanuit n8n.
+
+Verschil met originele banenplan app.py:
+- Geen KLEUR_MAP / extraheer_polygonen (geen gekleurde vlakken in woningbouw PDFs)
+- Polygonen komen van Claude Vision (via n8n), niet van PyMuPDF kleurdetectie
+- Rapport is gegroepeerd per woning (niet per vloertype)
+- SVG toont kamerindeling als gekleurde polygonen (niet banenplannen)
 """
 
 from flask import Flask, request, jsonify, Response
-import fitz  # PyMuPDF
-import base64
 import math
 import json
-import re
 from weasyprint import HTML as WeasyHTML
 
 app = Flask(__name__)
 
-# ── CONSTANTEN ─────────────────────────────────────────────────────────────
-PT_PER_M = 28.35        # A1 formaat, schaal 1:100
-BAANBREEDTE = 2.0       # meter
-SNIJVERLIES = 0.05      # 5%
-MIN_AREA_PX = 8000      # minimale vlakgrootte in px² (filtert kleine details weg)
+# ── KLEUREN PER RUIMTETYPE ───────────────────────────────────────────────
+KAMER_KLEUREN = {
+    'Woonkamer+keuken': {'bg': '#dbeafe', 'border': '#3b82f6', 'label': 'Woonkamer+keuken'},
+    'Slaapkamer 1':     {'bg': '#e0e7ff', 'border': '#6366f1', 'label': 'Slpk. 1'},
+    'Slaapkamer 2':     {'bg': '#ede9fe', 'border': '#8b5cf6', 'label': 'Slpk. 2'},
+    'Slaapkamer 3':     {'bg': '#f3e8ff', 'border': '#a855f7', 'label': 'Slpk. 3'},
+    'Hobbykamer':       {'bg': '#fce7f3', 'border': '#ec4899', 'label': 'Hobby'},
+    'Badkamer':         {'bg': '#cffafe', 'border': '#06b6d4', 'label': 'Badk.'},
+    'WC':               {'bg': '#dcfce7', 'border': '#22c55e', 'label': 'WC'},
+    'CV/MV/W':          {'bg': '#fef3c7', 'border': '#f59e0b', 'label': 'CV/MV/W'},
+    'vkr':              {'bg': '#e2e8f0', 'border': '#475569', 'label': 'VKR'},
+    'Berging':          {'bg': '#fef9c3', 'border': '#ca8a04', 'label': 'Berg.'},
+    'Loggia':           {'bg': '#ecfdf5', 'border': '#10b981', 'label': 'Loggia'},
+}
+DEFAULT_KAMER_KLEUR = {'bg': '#f1f5f9', 'border': '#94a3b8', 'label': '?'}
 
-# Kleur → vloertype mapping (RGB 0-1 afgerond op 2 decimalen)
-KLEUR_MAP = {
-    (1.0, 0.5, 0.25):  'marmo 3759',
-    (0.5, 1.0, 0.5):   'marmo 83285',
-    (0.5, 1.0, 1.0):   'gietvloer',
-    (1.0, 0.71, 0.5):  'marmo 3573',
-    (0.0, 1.0, 0.25):  'sportvloer 6011',
-    (0.0, 0.5, 1.0):   'gietvloer',
-    (0.5, 0.25, 0.0):  'Coral Brush 5774',
-    (1.0, 1.0, 0.5):   'marmo 3759',
-    (0.75, 0.5, 1.0):  'marmo 3573',
+WONING_TYPE_KLEUREN = {
+    'type A':  '#3b82f6',
+    'type B':  '#10b981',
+    'type B1': '#8b5cf6',
+    'type C':  '#f97316',
+    'type C1': '#ef4444',
+    'type C2': '#eab308',
 }
 
-# Vloertype → display kleur voor SVG
-VLOER_KLEUR = {
-    'marmo 3759':     {'bg': '#FFF3E0', 'baan1': '#FFE0B2', 'baan2': '#FFCC80', 'rand': '#E65100'},
-    'marmo 83285':    {'bg': '#E8F5E9', 'baan1': '#C8E6C9', 'baan2': '#A5D6A7', 'rand': '#2E7D32'},
-    'marmo 3573':     {'bg': '#E3F2FD', 'baan1': '#BBDEFB', 'baan2': '#90CAF9', 'rand': '#1565C0'},
-    'sportvloer 6011':{'bg': '#F3E5F5', 'baan1': '#E1BEE7', 'baan2': '#CE93D8', 'rand': '#6A1B9A'},
-    'gietvloer':      {'bg': '#E0F7FA', 'baan1': '#B2EBF2', 'baan2': '#80DEEA', 'rand': '#006064'},
-    'Coral Brush 5774':{'bg': '#FCE4EC','baan1': '#F8BBD9', 'baan2': '#F48FB1', 'rand': '#880E4F'},
-}
-DEFAULT_KLEUR = {'bg': '#F5F5F5', 'baan1': '#EEEEEE', 'baan2': '#E0E0E0', 'rand': '#424242'}
 
+# ── SVG POLYGON HELPERS ──────────────────────────────────────────────────
 
-# ── POLYGON HELPERS ────────────────────────────────────────────────────────
-
-def polygon_area(punten):
-    """Shoelace formule voor oppervlakte polygoon."""
+def polygon_centroid(punten):
+    """Bereken zwaartepunt van polygoon."""
     n = len(punten)
-    area = 0
-    for i in range(n):
-        j = (i + 1) % n
-        area += punten[i][0] * punten[j][1]
-        area -= punten[j][0] * punten[i][1]
-    return abs(area) / 2
+    if n == 0:
+        return (50, 50)
+    return (sum(p[0] for p in punten) / n, sum(p[1] for p in punten) / n)
 
 
-def clip_lijn_aan_polygoon(y, punten):
-    """
-    Geeft de x-segmenten waar horizontale lijn y het polygoon kruist.
-    Gebruikt ray casting / scanline intersection.
-    Returns: lijst van (x_start, x_end) paren (gesorteerd)
-    """
-    n = len(punten)
-    xs = []
-    for i in range(n):
-        x1, y1 = punten[i]
-        x2, y2 = punten[(i + 1) % n]
-        # Check of lijn y het segment [y1,y2] kruist
-        if (y1 <= y < y2) or (y2 <= y < y1):
-            # Bereken x-kruispunt
-            t = (y - y1) / (y2 - y1)
-            x = x1 + t * (x2 - x1)
-            xs.append(x)
-    xs.sort()
-    # Koppel xs in paren
-    segmenten = []
-    for i in range(0, len(xs) - 1, 2):
-        segmenten.append((xs[i], xs[i + 1]))
-    return segmenten
-
-
-def punten_naar_svg_path(punten, scale, pad_x, pad_y, min_x, min_y):
-    """Converteer punten lijst naar SVG path string."""
+def polygon_to_svg_points(punten, scale_x, scale_y, offset_x, offset_y):
+    """Converteer genormaliseerde punten (0-100) naar SVG path string."""
     parts = []
     for i, (x, y) in enumerate(punten):
-        sx = (x - min_x) * scale + pad_x
-        sy = (y - min_y) * scale + pad_y
-        parts.append(f"{'M' if i == 0 else 'L'}{sx:.1f},{sy:.1f}")
+        sx = offset_x + x * scale_x
+        sy = offset_y + y * scale_y
+        cmd = 'M' if i == 0 else 'L'
+        parts.append(f'{cmd}{sx:.1f},{sy:.1f}')
     return ' '.join(parts) + ' Z'
 
 
-# ── SVG GENERATOR ─────────────────────────────────────────────────────────
+def genereer_woning_svg(woning, svg_w=320, svg_h=220):
+    """
+    Genereert een SVG plattegrond voor één woning.
+    Gebruikt polygoon-coördinaten uit Claude Vision analyse.
+    Fallback: rechthoekige grid-layout op basis van m² verhoudingen.
+    """
+    kamers = woning.get('kamers', [])
+    voids = woning.get('voids', [])
 
-def genereer_banenplan_svg(ruimtenummer, naam, punten_m, vloertype,
-                            netto_m2, bruto_m2, aantal_banen):
-    """
-    Genereert een SVG banenplan voor één kamer.
-    Gebruikt exacte polygoonvorm met scanline banen.
-    """
-    if not punten_m or len(punten_m) < 3:
+    if not kamers:
         return None
 
-    kleur = VLOER_KLEUR.get(vloertype, DEFAULT_KLEUR)
+    pad = 8
+    inner_w = svg_w - pad * 2
+    inner_h = svg_h - pad * 2
+    scale_x = inner_w / 100.0
+    scale_y = inner_h / 100.0
 
-    xs = [p[0] for p in punten_m]
-    ys = [p[1] for p in punten_m]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    breedte = max_x - min_x
-    hoogte = max_y - min_y
+    svg_parts = [
+        f'<svg width="{svg_w}" height="{svg_h}" xmlns="http://www.w3.org/2000/svg">',
+        f'<rect width="{svg_w}" height="{svg_h}" fill="#f8fafc" rx="6" '
+        f'stroke="#cbd5e1" stroke-width="0.8"/>',
+        # Hatch pattern voor loze ruimtes
+        '<defs><pattern id="hatch" patternUnits="userSpaceOnUse" width="6" height="6" '
+        'patternTransform="rotate(45)">'
+        '<line x1="0" y1="0" x2="0" y2="6" stroke="#94a3b8" stroke-width="1" opacity="0.4"/>'
+        '</pattern></defs>',
+    ]
 
-    # Schaal zodat SVG maximaal 400px breed of 500px hoog wordt
-    max_w, max_h = 400, 480
-    scale = min(max_w / breedte if breedte > 0 else max_w,
-                max_h / hoogte if hoogte > 0 else max_h)
-    scale = max(scale, 15)  # minimaal 15px/m voor leesbaarheid
+    # Teken loze ruimtes (gearceerd)
+    for void_poly in voids:
+        if not void_poly or len(void_poly) < 3:
+            continue
+        path = polygon_to_svg_points(void_poly, scale_x, scale_y, pad, pad)
+        svg_parts.append(
+            f'<path d="{path}" fill="#f1f5f9" stroke="#cbd5e1" '
+            f'stroke-width="0.8" stroke-dasharray="3,2"/>'
+        )
+        svg_parts.append(f'<path d="{path}" fill="url(#hatch)"/>')
 
-    PAD_X, PAD_Y = 30, 30
-    SVG_W = breedte * scale + PAD_X * 2
-    SVG_H = hoogte * scale + PAD_Y * 2 + 50  # 50 voor legenda onderaan
+    # Teken kamers
+    for kamer in kamers:
+        naam = kamer.get('naam', '')
+        m2 = kamer.get('m2', 0)
+        poly = kamer.get('polygoon', [])
+        kleur = KAMER_KLEUREN.get(naam, DEFAULT_KAMER_KLEUR)
 
-    # Polygoon path
-    poly_path = punten_naar_svg_path(punten_m, scale, PAD_X, PAD_Y, min_x, min_y)
+        if not poly or len(poly) < 3:
+            # Geen polygoon data — sla over (of gebruik fallback)
+            continue
 
-    # Unieke clip-path ID per ruimte
-    clip_id = f"clip_{ruimtenummer.replace('.', '_')}"
+        path = polygon_to_svg_points(poly, scale_x, scale_y, pad, pad)
 
-    # ── Scanline banen ──────────────────────────────────────────────────
-    baan_rects = []
-    baan_labels = []
-    baan_nr = 1
+        # Kamer vulling + rand
+        svg_parts.append(
+            f'<path d="{path}" fill="{kleur["bg"]}" stroke="{kleur["border"]}" '
+            f'stroke-width="1.8" stroke-linejoin="round"/>'
+        )
 
-    # Banen lopen langs de Y-as (kortste as = breedte, langste = legrichting)
-    # We bepalen legrichting: banen langs langste wand = strepen langs kortste dimensie
-    if breedte >= hoogte:
-        # Banen verticaal (langs Y)
-        staprichting = 'x'
-        stap_start = min_x
-        stap_einde = max_x
-        scanmin = min_y
-        scanmax = max_y
-    else:
-        # Banen horizontaal (langs X) — meest voorkomend
-        staprichting = 'y'
-        stap_start = min_y
-        stap_einde = max_y
-        scanmin = min_x
-        scanmax = max_x
+        # Label positionering
+        cx, cy = polygon_centroid(poly)
+        tx = pad + cx * scale_x
+        ty = pad + cy * scale_y
 
-    baan_kleuren = [kleur['baan1'], kleur['baan2']]
+        # Bereken breedte/hoogte voor font sizing
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        rw = (max(xs) - min(xs)) * scale_x
+        rh = (max(ys) - min(ys)) * scale_y
 
-    if staprichting == 'y':
-        y = stap_start
-        while y < stap_einde - 0.01:
-            y_next = min(y + BAANBREEDTE, stap_einde)
-            baan_kleur = baan_kleuren[(baan_nr - 1) % 2]
+        # Speciale label-positie voor L-vormige VKR
+        if naam == 'vkr' and rw > rh * 2:
+            # VKR is breed — zet label in het bredere deel
+            cx_adj = (max(xs) + min(xs) + max(xs)) / 3  # bias naar rechts
+            tx = pad + cx_adj * scale_x
 
-            # Meerdere y-samples voor nauwkeurige baan weergave
-            for sample_y in [y + 0.01, y + BAANBREEDTE * 0.5, y_next - 0.01]:
-                if sample_y >= stap_einde:
-                    continue
-                segs = clip_lijn_aan_polygoon(sample_y, punten_m)
-                for (x0, x1) in segs:
-                    rx = (x0 - min_x) * scale + PAD_X
-                    ry = (y - min_y) * scale + PAD_Y
-                    rw = (x1 - x0) * scale
-                    rh = (y_next - y) * scale
-                    if rw > 1:
-                        baan_rects.append(
-                            f'<rect x="{rx:.1f}" y="{ry:.1f}" width="{rw:.1f}" height="{rh:.1f}" '
-                            f'fill="{baan_kleur}" opacity="0.85" clip-path="url(#{clip_id})"/>'
-                        )
+        # Label tekst
+        short_name = kleur.get('label', naam[:8])
+        name_lines = short_name.split('+')
+        if naam == 'Woonkamer+keuken':
+            name_lines = ['Woonkamer', '+keuken']
 
-            # Baanlabel — midden van baan
-            mid_segs = clip_lijn_aan_polygoon(y + BAANBREEDTE * 0.5, punten_m)
-            if mid_segs:
-                x0, x1 = mid_segs[0]
-                lx = (x0 - min_x) * scale + PAD_X + 3
-                ly = (y - min_y + BAANBREEDTE * 0.5) * scale + PAD_Y + 4
-                baan_labels.append(
-                    f'<text x="{lx:.1f}" y="{ly:.1f}" font-size="9" '
-                    f'fill="#333" font-family="Arial" font-weight="bold">{baan_nr}</text>'
+        if rw > 24 and rh > 14:
+            fs = min(10, rw / 7, rh / 4)
+            fs = max(fs, 4.5)
+            total_h = fs * (len(name_lines) + 1)
+            start_y = ty - total_h / 2 + fs
+
+            for i, line in enumerate(name_lines):
+                svg_parts.append(
+                    f'<text x="{tx:.1f}" y="{start_y + i * fs:.1f}" '
+                    f'font-family="Helvetica,Arial,sans-serif" font-size="{fs:.1f}" '
+                    f'font-weight="bold" fill="{kleur["border"]}" '
+                    f'text-anchor="middle">{line}</text>'
                 )
 
-            y = y_next
-            baan_nr += 1
-
-    else:  # staprichting == 'x'
-        x = stap_start
-        while x < stap_einde - 0.01:
-            x_next = min(x + BAANBREEDTE, stap_einde)
-            baan_kleur = baan_kleuren[(baan_nr - 1) % 2]
-
-            # Transponeer de polygoon voor x-richting
-            punten_t = [(p[1], p[0]) for p in punten_m]
-            for sample_x in [x + 0.01, x + BAANBREEDTE * 0.5, x_next - 0.01]:
-                if sample_x >= stap_einde:
-                    continue
-                segs = clip_lijn_aan_polygoon(sample_x, punten_t)
-                for (y0, y1) in segs:
-                    rx = (x - min_x) * scale + PAD_X
-                    ry = (y0 - min_y) * scale + PAD_Y
-                    rw = (x_next - x) * scale
-                    rh = (y1 - y0) * scale
-                    if rh > 1:
-                        baan_rects.append(
-                            f'<rect x="{rx:.1f}" y="{ry:.1f}" width="{rw:.1f}" height="{rh:.1f}" '
-                            f'fill="{baan_kleur}" opacity="0.85" clip-path="url(#{clip_id})"/>'
-                        )
-
-            mid_segs = clip_lijn_aan_polygoon(x + BAANBREEDTE * 0.5, punten_t)
-            if mid_segs:
-                y0, y1 = mid_segs[0]
-                lx = (x - min_x + BAANBREEDTE * 0.5) * scale + PAD_X
-                ly = (y0 - min_y) * scale + PAD_Y + (y1 - y0) * scale * 0.5 + 4
-                baan_labels.append(
-                    f'<text x="{lx:.1f}" y="{ly:.1f}" font-size="9" '
-                    f'fill="#333" font-family="Arial" font-weight="bold" '
-                    f'text-anchor="middle">{baan_nr}</text>'
-                )
-
-            x = x_next
-            baan_nr += 1
-
-    # Rasterlijnen per baan
-    raster_lijnen = []
-    if staprichting == 'y':
-        y = stap_start
-        while y <= stap_einde + 0.01:
-            ly = (y - min_y) * scale + PAD_Y
-            raster_lijnen.append(
-                f'<line x1="{PAD_X}" y1="{ly:.1f}" x2="{PAD_X + breedte*scale:.1f}" '
-                f'y2="{ly:.1f}" stroke="{kleur["rand"]}" stroke-width="1.2" '
-                f'stroke-dasharray="5,3" clip-path="url(#{clip_id})"/>'
+            # m² waarde
+            m2_fs = max(fs - 1.5, 4)
+            svg_parts.append(
+                f'<text x="{tx:.1f}" y="{start_y + len(name_lines) * fs + 1:.1f}" '
+                f'font-family="Helvetica,Arial,sans-serif" font-size="{m2_fs:.1f}" '
+                f'fill="#64748b" text-anchor="middle">{m2} m²</text>'
             )
-            y += BAANBREEDTE
-    else:
-        x = stap_start
-        while x <= stap_einde + 0.01:
-            lx = (x - min_x) * scale + PAD_X
-            raster_lijnen.append(
-                f'<line x1="{lx:.1f}" y1="{PAD_Y}" x2="{lx:.1f}" '
-                f'y2="{PAD_Y + hoogte*scale:.1f}" stroke="{kleur["rand"]}" '
-                f'stroke-width="1.2" stroke-dasharray="5,3" '
-                f'clip-path="url(#{clip_id})"/>'
+        elif rw > 10 and rh > 7:
+            fs = min(5.5, rw / 3.5, rh / 2.5)
+            svg_parts.append(
+                f'<text x="{tx:.1f}" y="{ty + 2:.1f}" '
+                f'font-family="Helvetica,Arial,sans-serif" font-size="{fs:.1f}" '
+                f'font-weight="bold" fill="{kleur["border"]}" '
+                f'text-anchor="middle">{name_lines[0][:6]}</text>'
             )
-            x += BAANBREEDTE
 
-    # Maatpijlen (breedte en hoogte)
-    pijl_kleur = kleur['rand']
-    maat_svg = (
-        f'<line x1="{PAD_X}" y1="{PAD_Y + hoogte*scale + 12}" '
-        f'x2="{PAD_X + breedte*scale}" y2="{PAD_Y + hoogte*scale + 12}" '
-        f'stroke="{pijl_kleur}" stroke-width="1.5" marker-end="url(#pijl)"/>'
-        f'<text x="{PAD_X + breedte*scale/2}" y="{PAD_Y + hoogte*scale + 24}" '
-        f'font-size="9" fill="{pijl_kleur}" text-anchor="middle" font-family="Arial">'
-        f'{breedte:.1f}m</text>'
-    )
-
-    svg = f'''<svg width="{SVG_W:.0f}" height="{SVG_H:.0f}" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <clipPath id="{clip_id}">
-      <path d="{poly_path}"/>
-    </clipPath>
-    <marker id="pijl" markerWidth="6" markerHeight="6" refX="6" refY="3" orient="auto">
-      <path d="M0,0 L6,3 L0,6 Z" fill="{pijl_kleur}"/>
-    </marker>
-  </defs>
-
-  <!-- Achtergrond kamer -->
-  <path d="{poly_path}" fill="{kleur['bg']}" stroke="none"/>
-
-  <!-- Banen geclipped -->
-  {''.join(baan_rects)}
-
-  <!-- Rasterlijnen -->
-  {''.join(raster_lijnen)}
-
-  <!-- Kamercontour -->
-  <path d="{poly_path}" fill="none" stroke="{kleur['rand']}" stroke-width="2"/>
-
-  <!-- Baannummers -->
-  {''.join(baan_labels)}
-
-  <!-- Maatpijl -->
-  {maat_svg}
-
-  <!-- Info label -->
-  <text x="{PAD_X}" y="{SVG_H - 28}" font-size="10" font-weight="bold"
-    fill="{kleur['rand']}" font-family="Arial">{ruimtenummer} {naam}</text>
-  <text x="{PAD_X}" y="{SVG_H - 14}" font-size="9" fill="#555" font-family="Arial">
-    {vloertype} | {netto_m2}m² netto | {aantal_banen} banen | {bruto_m2}m² bestellen</text>
-</svg>'''
-
-    return svg
+    svg_parts.append('</svg>')
+    return '\n'.join(svg_parts)
 
 
-# ── PDF POLYGON EXTRACTOR ─────────────────────────────────────────────────
+# ── FALLBACK: RECHTHOEKIGE LAYOUT ────────────────────────────────────────
 
-def extraheer_polygonen(pdf_bytes):
+def genereer_fallback_polygonen(kamers):
     """
-    Extraheert gekleurde kamervlakken uit PDF als polygonen in meters.
-    Returns: dict van ruimtenummer -> {punten_m, vloertype, ...}
+    Als Claude Vision geen polygonen levert, genereer een simpele
+    grid-layout op basis van m² verhoudingen.
+    Retourneert kamers verrijkt met 'polygoon' veld.
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-    paths = page.get_drawings()
+    if not kamers:
+        return kamers
 
-    # Haal tekst labels op voor koppeling
-    text_blocks = page.get_text('dict')['blocks']
-    labels = []
-    for b in text_blocks:
-        if b['type'] == 0:
-            for line in b['lines']:
-                for span in line['spans']:
-                    t = span['text'].strip()
-                    if t:
-                        labels.append({
-                            'text': t,
-                            'x': span['origin'][0],
-                            'y': span['origin'][1]
-                        })
+    total_m2 = sum(k.get('m2', 0) for k in kamers)
+    if total_m2 == 0:
+        return kamers
 
-    kamers = {}
+    # Sorteer: grote kamers eerst
+    sorted_k = sorted(kamers, key=lambda k: -k.get('m2', 0))
 
-    for p in paths:
-        fill = p.get('fill')
-        rect = p.get('rect')
-        if not fill or not rect:
-            continue
+    # Simpele row-packing
+    y_cursor = 0
+    for k in sorted_k:
+        frac = k.get('m2', 0) / total_m2
+        row_h = max(frac * 100 * 1.5, 8)
+        row_h = min(row_h, 50)
 
-        fill_r = tuple(round(c, 2) for c in fill)
-        if fill_r not in KLEUR_MAP:
-            continue
-        if fill_r == (1.0, 1.0, 1.0):  # wit = wand/achtergrond
-            continue
+        if y_cursor + row_h > 100:
+            row_h = 100 - y_cursor
 
-        area_px = rect.width * rect.height
-        if area_px < MIN_AREA_PX:
-            continue
-
-        # Haal polygon punten op
-        items = p.get('items', [])
-        punten_px = []
-        for item in items:
-            if item[0] == 'l':
-                punten_px.append((item[1].x, item[1].y))
-            elif item[0] == 're':
-                r = item[1]
-                punten_px += [(r.x0, r.y0), (r.x1, r.y0),
-                               (r.x1, r.y1), (r.x0, r.y1)]
-
-        if len(punten_px) < 3:
-            continue
-
-        # Dedupliceer aangrenzende punten
-        uniek = [punten_px[0]]
-        for pt in punten_px[1:]:
-            if abs(pt[0] - uniek[-1][0]) > 0.5 or abs(pt[1] - uniek[-1][1]) > 0.5:
-                uniek.append(pt)
-        punten_px = uniek
-
-        # Vind ruimtenummer via labels in dit vlak
-        ruimtenummer = None
-        vlak_labels = []
-        for lbl in labels:
-            if rect.x0 <= lbl['x'] <= rect.x1 and rect.y0 <= lbl['y'] <= rect.y1:
-                vlak_labels.append(lbl['text'])
-                if re.match(r'^\d+\.\d+$', lbl['text']) and not ruimtenummer:
-                    ruimtenummer = lbl['text']
-
-        if not ruimtenummer:
-            continue
-
-        # Converteer punten naar meters (relatief t.o.v. bounding box)
-        min_x = min(pt[0] for pt in punten_px)
-        min_y = min(pt[1] for pt in punten_px)
-        punten_m = [
-            (round((pt[0] - min_x) / PT_PER_M, 3),
-             round((pt[1] - min_y) / PT_PER_M, 3))
-            for pt in punten_px
+        k['polygoon'] = [
+            [0, y_cursor],
+            [100, y_cursor],
+            [100, y_cursor + row_h],
+            [0, y_cursor + row_h]
         ]
+        y_cursor += row_h + 1
 
-        vloertype = KLEUR_MAP[fill_r]
-        area_m2 = round(polygon_area(punten_m), 2)
-
-        # Sla op — bij duplicaat ruimtenummer kies grootste vlak
-        if ruimtenummer not in kamers or area_m2 > kamers[ruimtenummer]['area_m2']:
-            kamers[ruimtenummer] = {
-                'ruimtenummer': ruimtenummer,
-                'vloertype': vloertype,
-                'punten_m': punten_m,
-                'area_m2': area_m2,
-                'bounding_m': {
-                    'breedte': round(rect.width / PT_PER_M, 2),
-                    'hoogte': round(rect.height / PT_PER_M, 2)
-                },
-                'aantal_hoeken': len(punten_m),
-                'is_l_vorm': len(punten_m) > 4,
-                'labels': vlak_labels[:8]
-            }
-
-    doc.close()
     return kamers
 
 
-# ── API ENDPOINTS ──────────────────────────────────────────────────────────
+# ── HTML RAPPORT GENERATOR ───────────────────────────────────────────────
+
+def genereer_rapport_html(woningen, gemeenschappelijk, per_type, totalen):
+    """Genereert volledig HTML rapport met SVG plattegronden."""
+
+    # Overzichtstabel per type
+    type_rijen = ''
+    for wtype, data in sorted(per_type.items()):
+        kleur = WONING_TYPE_KLEUREN.get(wtype, '#64748b')
+        type_rijen += f'''<tr>
+          <td><span style="display:inline-block;width:12px;height:12px;
+            background:{kleur};border-radius:3px;margin-right:8px;vertical-align:middle">
+            </span>{wtype}</td>
+          <td style="text-align:center">{data.get("count", 0)}</td>
+          <td>{", ".join(data.get("woningen", []))}</td>
+          <td>{", ".join(data.get("voorbeeld_kamers", [])[:5])}</td>
+        </tr>'''
+
+    # Woningtabel
+    woning_rijen = ''
+    for i, w in enumerate(woningen):
+        bg = '#ffffff' if i % 2 == 0 else '#f8fafc'
+        kleur = WONING_TYPE_KLEUREN.get(w.get('woning_type', ''), '#64748b')
+        wk = sum(k.get('m2', 0) for k in w.get('kamers', []) if k.get('naam') == 'Woonkamer+keuken')
+        sk = sum(k.get('m2', 0) for k in w.get('kamers', []) if 'Slaapkamer' in k.get('naam', ''))
+        bk = sum(k.get('m2', 0) for k in w.get('kamers', []) if k.get('naam') == 'Badkamer')
+        woning_rijen += f'''<tr style="background:{bg}">
+          <td><strong>{w.get("woning_nr", "")}</strong></td>
+          <td><span style="color:{kleur};font-weight:600">{w.get("woning_type", "")}</span></td>
+          <td style="text-align:center;font-weight:bold">{w.get("totaal_m2", "")}</td>
+          <td style="text-align:center">{len(w.get("kamers", []))}</td>
+          <td style="text-align:center">{wk:.1f}</td>
+          <td style="text-align:center">{sk:.1f}</td>
+          <td style="text-align:center">{bk:.1f}</td>
+        </tr>'''
+
+    # SVG plattegronden per woning
+    svg_secties = ''
+    for w in woningen:
+        nr = w.get('woning_nr', '')
+        wtype = w.get('woning_type', '')
+        kleur = WONING_TYPE_KLEUREN.get(wtype, '#64748b')
+        kamers = w.get('kamers', [])
+
+        # Check of polygonen aanwezig zijn
+        has_polys = any(k.get('polygoon') for k in kamers)
+        if not has_polys:
+            kamers = genereer_fallback_polygonen(kamers)
+            w['kamers'] = kamers
+
+        svg = genereer_woning_svg(w)
+        if not svg:
+            continue
+
+        # Kamertabel
+        kamer_rijen = ''
+        for k in kamers:
+            kk = KAMER_KLEUREN.get(k.get('naam', ''), DEFAULT_KAMER_KLEUR)
+            kamer_rijen += f'''<tr>
+              <td style="padding:4px 8px">
+                <span style="display:inline-block;width:10px;height:10px;
+                  background:{kk["bg"]};border:1.5px solid {kk["border"]};
+                  border-radius:2px;margin-right:6px;vertical-align:middle"></span>
+                {k.get("naam", "")}
+              </td>
+              <td style="text-align:center;font-weight:bold;padding:4px">{k.get("m2", "")}</td>
+              <td style="text-align:center;color:#64748b;padding:4px;font-size:11px">
+                {k.get("lengte_m", "-")} × {k.get("breedte_m", "-")}
+              </td>
+            </tr>'''
+
+        total_kamers = round(sum(k.get('m2', 0) for k in kamers), 2)
+
+        svg_secties += f'''
+        <div style="break-inside:avoid;margin-bottom:24px;
+          border:1px solid #e2e8f0;border-radius:8px;overflow:hidden">
+          <div style="background:{kleur};padding:10px 16px;color:white;
+            font-weight:bold;font-size:14px;font-family:Arial">
+            Woning {nr} — {wtype} — {w.get("totaal_m2", "")} m²
+          </div>
+          <div style="display:flex;gap:16px;padding:16px;background:white">
+            <div style="flex:0 0 40%">
+              <table style="width:100%;font-size:12px;border-collapse:collapse">
+                <tr style="border-bottom:1px solid #e2e8f0">
+                  <th style="text-align:left;padding:4px 8px;color:#64748b;font-size:10px">RUIMTE</th>
+                  <th style="text-align:center;padding:4px;color:#64748b;font-size:10px">M²</th>
+                  <th style="text-align:center;padding:4px;color:#64748b;font-size:10px">L×B</th>
+                </tr>
+                {kamer_rijen}
+                <tr style="border-top:2px solid {kleur}">
+                  <td style="padding:6px 8px;font-weight:bold;color:{kleur}">Totaal</td>
+                  <td style="text-align:center;font-weight:bold;color:{kleur};padding:6px">{total_kamers}</td>
+                  <td></td>
+                </tr>
+              </table>
+            </div>
+            <div style="flex:1">
+              {svg}
+            </div>
+          </div>
+        </div>'''
+
+    # Gemeenschappelijke ruimtes
+    gem_rijen = ''
+    for g in gemeenschappelijk:
+        gem_rijen += f'''<tr>
+          <td style="padding:4px 8px">{g.get("ruimte_id", g.get("id", ""))}</td>
+          <td>{g.get("naam", "")}</td>
+          <td style="text-align:center;font-weight:bold">{g.get("m2", "")}</td>
+        </tr>'''
+
+    gem_totaal = round(sum(g.get('m2', 0) for g in gemeenschappelijk), 2)
+
+    html = f'''<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<style>
+  body {{ font-family: Arial, sans-serif; margin: 40px; color: #1e293b; }}
+  h1 {{ color: #1a365d; border-bottom: 3px solid #3b82f6; padding-bottom: 8px; font-size: 24px; }}
+  h2 {{ color: #1a365d; margin-top: 32px; font-size: 18px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }}
+  th {{ background: #1a365d; color: white; padding: 8px; text-align: left; }}
+  td {{ padding: 7px 8px; border-bottom: 1px solid #e2e8f0; }}
+  .stat-box {{ display: inline-block; background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 8px; padding: 16px 24px; margin-right: 12px; margin-bottom: 12px; }}
+  .stat-label {{ font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .stat-value {{ font-size: 28px; font-weight: bold; margin-top: 4px; }}
+  .meta {{ color: #94a3b8; font-size: 11px; margin-top: 6px; }}
+</style></head><body>
+
+<h1>Plattegrond Extractie Rapport</h1>
+<div class="meta">AI-analyse via PyMuPDF + Claude Vision | Automatisch gegenereerd</div>
+
+<div style="margin:20px 0">
+  <div class="stat-box">
+    <div class="stat-label">Woningen</div>
+    <div class="stat-value" style="color:#1a365d">{totalen.get("woningen", 0)}</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-label">Ruimtes</div>
+    <div class="stat-value" style="color:#059669">{totalen.get("kamers", 0)}</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-label">Woon m²</div>
+    <div class="stat-value" style="color:#ea580c">{totalen.get("woonM2", 0)}</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-label">Gemeensch. m²</div>
+    <div class="stat-value" style="color:#64748b">{totalen.get("gemeenschappelijkM2", 0)}</div>
+  </div>
+</div>
+
+<h2>Overzicht per woningtype</h2>
+<table>
+  <tr><th>Type</th><th>Aantal</th><th>Woningnrs</th><th>Kamers</th></tr>
+  {type_rijen}
+</table>
+
+<h2>Alle woningen</h2>
+<table>
+  <tr><th>Nr.</th><th>Type</th><th>Totaal m²</th><th>Kamers</th>
+  <th>Woonk.</th><th>Slpk.</th><th>Badk.</th></tr>
+  {woning_rijen}
+  <tr style="background:#d1fae5;font-weight:bold">
+    <td colspan="2">TOTAAL</td>
+    <td style="text-align:center">{totalen.get("woonM2", 0)}</td>
+    <td colspan="4"></td>
+  </tr>
+</table>
+
+<h2>Plattegronden per woning</h2>
+{svg_secties}
+
+<h2>Gemeenschappelijke ruimtes</h2>
+<table>
+  <tr><th>ID</th><th>Ruimte</th><th>m²</th></tr>
+  {gem_rijen}
+  <tr style="background:#d1fae5;font-weight:bold">
+    <td colspan="2">TOTAAL</td>
+    <td style="text-align:center">{gem_totaal}</td>
+  </tr>
+</table>
+
+<p class="meta" style="margin-top:32px">Gegenereerd door Plattegrond Extractie Service | Eikom B.V.</p>
+</body></html>'''
+
+    return html
+
+
+# ── API ENDPOINTS ────────────────────────────────────────────────────────
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'banenplan-service'})
+    return jsonify({
+        'status': 'ok',
+        'service': 'woningbouw-extractie',
+        'version': '0.1'
+    })
 
 
-@app.route('/polygonen', methods=['POST'])
-def polygonen():
+@app.route('/woningrapport', methods=['POST'])
+def woningrapport():
     """
-    Extraheert polygonen uit PDF.
-    Input: { "pdf_base64": "..." }
-    Output: { "kamers": { "0.02": { punten_m, vloertype, ... }, ... } }
-    """
-    data = request.get_json()
-    if not data or 'pdf_base64' not in data:
-        return jsonify({'error': 'pdf_base64 vereist'}), 400
+    Genereert PDF rapport op basis van geëxtraheerde woningdata + polygonen.
 
-    pdf_bytes = base64.b64decode(data['pdf_base64'])
-    kamers = extraheer_polygonen(pdf_bytes)
-    return jsonify({'kamers': kamers, 'aantal': len(kamers)})
-
-
-@app.route('/banenplan', methods=['POST'])
-def banenplan():
-    """
-    Genereert SVG banenplannen op basis van:
-    1. PDF binary (voor exacte polygonen)
-    2. Claude JSON output (voor m², vloertype, banen)
-
-    Input: {
-      "pdf_base64": "...",
-      "ruimtes": [ { ruimtenummer, naam, netto_m2, bruto_m2, aantal_banen, vloertype } ]
+    Input JSON:
+    {
+      "woningen": [
+        {
+          "woning_nr": "001",
+          "woning_type": "type A",
+          "totaal_m2": 76.89,
+          "kamers": [
+            {
+              "naam": "Woonkamer+keuken",
+              "m2": 31.59,
+              "lengte_m": 7.8,
+              "breedte_m": 4.1,
+              "polygoon": [[0,0], [44,0], [44,100], [0,100]]
+            }
+          ],
+          "voids": [[[72,30], [78,30], [78,42], [72,42]]]
+        }
+      ],
+      "gemeenschappelijk": [...],
+      "perType": {...},
+      "totalen": {...}
     }
-    Output: {
-      "svgs": { "0.02": "<svg>...</svg>", ... },
-      "html_rapport": "<html>...</html>"
-    }
+
+    Output: PDF binary
     """
-    data = request.get_json()
+    data = request.get_json(force=True, silent=True)
+    if isinstance(data, str):
+        data = json.loads(data)
+
     if not data:
         return jsonify({'error': 'JSON body vereist'}), 400
 
-    # Haal polygonen uit PDF
-    pdf_bytes = base64.b64decode(data['pdf_base64'])
-    polygonen_map = extraheer_polygonen(pdf_bytes)
+    woningen = data.get('woningen', [])
+    gemeenschappelijk = data.get('gemeenschappelijk', [])
+    per_type = data.get('perType', {})
+    totalen = data.get('totalen', {})
 
-    # Ruimtes array van Claude
-    ruimtes = data.get('ruimtes', [])
-    if not ruimtes:
-        return jsonify({'error': 'ruimtes array vereist'}), 400
-
-    svgs = {}
-    gemiste_ruimtes = []
-
-    for r in ruimtes:
-        nr = r.get('ruimtenummer', '')
-        naam = r.get('naam', '')
-        netto = r.get('netto_m2', 0)
-        bruto = r.get('bruto_m2', 0)
-        banen = r.get('aantal_banen', 0)
-        vloertype = r.get('vloertype', '')
-
-        if nr in polygonen_map:
-            poly = polygonen_map[nr]
-            svg = genereer_banenplan_svg(
-                ruimtenummer=nr,
-                naam=naam,
-                punten_m=poly['punten_m'],
-                vloertype=vloertype or poly['vloertype'],
-                netto_m2=netto,
-                bruto_m2=bruto,
-                aantal_banen=banen
-            )
-            if svg:
-                svgs[nr] = svg
-        else:
-            gemiste_ruimtes.append(nr)
+    if not woningen:
+        return jsonify({'error': 'woningen array vereist'}), 400
 
     # Genereer HTML rapport
-    html = genereer_html_rapport(ruimtes, svgs)
-    # Sla HTML ook op als apart endpoint beschikbaar
-    app._last_html = html  # tijdelijk in memory voor /banenplan/html
+    html = genereer_rapport_html(woningen, gemeenschappelijk, per_type, totalen)
 
     # Converteer naar PDF
     pdf_bytes = WeasyHTML(string=html).write_pdf()
@@ -498,179 +474,34 @@ def banenplan():
         pdf_bytes,
         mimetype='application/pdf',
         headers={
-            'Content-Disposition': 'attachment; filename="banenplan_rapport.pdf"',
+            'Content-Disposition': 'attachment; filename="extractie_rapport.pdf"',
         }
     )
 
-def genereer_html_rapport(ruimtes, svgs):
-    """Bouwt volledig HTML rapport met SVG banenplannen en uittrekstaat."""
 
-    # Totalen
-    totaal_netto = sum(r.get('netto_m2', 0) for r in ruimtes)
-    totaal_bruto = sum(r.get('bruto_m2', 0) for r in ruimtes)
-
-    # Per vloertype
-    per_type = {}
-    for r in ruimtes:
-        vt = r.get('vloertype', 'onbekend')
-        if vt not in per_type:
-            per_type[vt] = {'netto': 0, 'bruto': 0, 'ruimtes': []}
-        per_type[vt]['netto'] = round(per_type[vt]['netto'] + r.get('netto_m2', 0), 2)
-        per_type[vt]['bruto'] = round(per_type[vt]['bruto'] + r.get('bruto_m2', 0), 2)
-        per_type[vt]['ruimtes'].append(r.get('ruimtenummer', ''))
-
-    # Uittrekstaat tabel
-    rijen = ''
-    for i, r in enumerate(ruimtes):
-        bg = '#ffffff' if i % 2 == 0 else '#f1f8f1'
-        rijen += f'''<tr style="background:{bg}">
-          <td>{r.get("ruimtenummer","")}</td>
-          <td>{r.get("naam","")}</td>
-          <td>{r.get("vloertype","")}</td>
-          <td style="text-align:center">{r.get("netto_m2","")}</td>
-          <td style="text-align:center">{r.get("lengte_m","")}</td>
-          <td style="text-align:center">{r.get("breedte_m","")}</td>
-          <td style="text-align:center">{r.get("aantal_banen","")}</td>
-          <td style="text-align:center;font-weight:bold">{r.get("bruto_m2","")}</td>
-        </tr>'''
-
-    # Vloertype samenvatting
-    type_rijen = ''
-    for vt, data in sorted(per_type.items(), key=lambda x: -x[1]['bruto']):
-        kleur = VLOER_KLEUR.get(vt, DEFAULT_KLEUR)
-        type_rijen += f'''<tr>
-          <td style="display:flex;align-items:center;gap:8px">
-            <span style="display:inline-block;width:16px;height:16px;
-              background:{kleur["baan1"]};border:2px solid {kleur["rand"]};
-              border-radius:3px"></span>{vt}
-          </td>
-          <td style="text-align:center">{len(data["ruimtes"])}</td>
-          <td style="text-align:center">{data["netto"]}</td>
-          <td style="text-align:center;font-weight:bold">{data["bruto"]}</td>
-        </tr>'''
-
-    # SVG secties — sorteer op bruto m² (grootste eerst)
-    ruimtes_gesorteerd = sorted(
-        [r for r in ruimtes if r.get('ruimtenummer') in svgs],
-        key=lambda x: -x.get('bruto_m2', 0)
-    )
-
-    svg_secties = ''
-    for r in ruimtes_gesorteerd:
-        nr = r.get('ruimtenummer', '')
-        if nr not in svgs:
-            continue
-        kleur = VLOER_KLEUR.get(r.get('vloertype', ''), DEFAULT_KLEUR)
-        svg_secties += f'''
-        <div style="break-inside:avoid;margin-bottom:32px;
-          border:1px solid {kleur["rand"]};border-radius:8px;
-          overflow:hidden;display:inline-block;margin-right:24px;
-          vertical-align:top">
-          <div style="background:{kleur["rand"]};padding:8px 14px;color:white;
-            font-weight:bold;font-size:13px;font-family:Arial">
-            {nr} — {r.get("naam","")}
-          </div>
-          <div style="padding:12px;background:white">
-            {svgs[nr]}
-          </div>
-        </div>'''
-
-    html = f'''<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<style>
-  body {{ font-family: Arial, sans-serif; margin: 40px; color: #222; }}
-  h1 {{ color: #1B5E20; border-bottom: 3px solid #1B5E20; padding-bottom: 8px; }}
-  h2 {{ color: #1B5E20; margin-top: 32px; }}
-  table {{ width:100%; border-collapse:collapse; margin-top:12px; font-size:12px; }}
-  th {{ background:#1B5E20; color:white; padding:8px; text-align:left; }}
-  td {{ padding:7px 8px; border-bottom:1px solid #ddd; }}
-  .totaal {{ background:#C8E6C9 !important; font-weight:bold; }}
-  .kader {{ background:#E8F5E9; border-left:4px solid #1B5E20;
-            padding:12px 16px; margin:16px 0; border-radius:4px; }}
-  .meta {{ color:#666; font-size:11px; margin-top:6px; }}
-</style></head><body>
-
-<h1>&#x1F4CB; Banenplan Rapport — Automatisch Gegenereerd</h1>
-<div class="meta">Baanbreedte: {BAANBREEDTE}m | Snijverlies: {SNIJVERLIES*100:.0f}% | AI-analyse via Claude + PyMuPDF</div>
-
-<div class="kader">
-  <strong>Totaal netto m²:</strong> {round(totaal_netto,2)} m²&nbsp;&nbsp;&nbsp;
-  <strong>Totaal bruto bestellen:</strong> {round(totaal_bruto,2)} m²&nbsp;&nbsp;&nbsp;
-  <strong>Ruimtes:</strong> {len(ruimtes)}&nbsp;&nbsp;&nbsp;
-  <strong>Banenplannen gegenereerd:</strong> {len(svgs)}
-</div>
-
-<h2>&#x1F9F5; Overzicht per vloertype</h2>
-<table>
-  <tr><th>Vloertype</th><th>Ruimtes</th><th>Netto m²</th><th>Bruto m²</th></tr>
-  {type_rijen}
-</table>
-
-<h2>&#x1F4D0; Banenplannen per ruimte</h2>
-<div style="margin-top:16px">
-  {svg_secties}
-</div>
-
-<h2>&#x1F4CB; Volledige uittrekstaat</h2>
-<table>
-  <tr>
-    <th>Nr.</th><th>Ruimtenaam</th><th>Vloertype</th>
-    <th>Netto m²</th><th>Lengte m</th><th>Breedte m</th>
-    <th>Banen</th><th>Bruto m²</th>
-  </tr>
-  {rijen}
-  <tr class="totaal">
-    <td colspan="3">TOTAAL</td>
-    <td style="text-align:center">{round(totaal_netto,2)}</td>
-    <td></td><td></td><td></td>
-    <td style="text-align:center">{round(totaal_bruto,2)}</td>
-  </tr>
-</table>
-
-<p class="meta">Gegenereerd door Banenplan Service | Puur Vloeren Groep demo</p>
-</body></html>'''
-
-    return html
-@app.route('/banenplan/html', methods=['POST'])
-def banenplan_html():
-    """Zelfde als /banenplan maar geeft HTML terug in plaats van PDF."""
+@app.route('/woningrapport/html', methods=['POST'])
+def woningrapport_html():
+    """Zelfde als /woningrapport maar retourneert HTML."""
     data = request.get_json(force=True, silent=True)
     if isinstance(data, str):
-        import json as json_module
-        data = json_module.loads(data)
+        data = json.loads(data)
 
-    pdf_b64 = data.get('pdf_base64', '')
-    if ',' in pdf_b64:
-        pdf_b64 = pdf_b64.split(',', 1)[1]
+    if not data:
+        return jsonify({'error': 'JSON body vereist'}), 400
 
-    pdf_bytes = base64.b64decode(pdf_b64)
-    polygonen_map = extraheer_polygonen(pdf_bytes)
-    ruimtes = data.get('ruimtes', [])
-
-    svgs = {}
-    for r in ruimtes:
-        nr = r.get('ruimtenummer', '')
-        if nr in polygonen_map:
-            poly = polygonen_map[nr]
-            svg = genereer_banenplan_svg(
-                ruimtenummer=nr,
-                naam=r.get('naam', ''),
-                punten_m=poly['punten_m'],
-                vloertype=r.get('vloertype') or poly['vloertype'],
-                netto_m2=r.get('netto_m2', 0),
-                bruto_m2=r.get('bruto_m2', 0),
-                aantal_banen=r.get('aantal_banen', 0)
-            )
-            if svg:
-                svgs[nr] = svg
-
-    html = genereer_html_rapport(ruimtes, svgs)
+    html = genereer_rapport_html(
+        data.get('woningen', []),
+        data.get('gemeenschappelijk', []),
+        data.get('perType', {}),
+        data.get('totalen', {})
+    )
 
     return Response(
         html,
         mimetype='text/html',
-        headers={'Content-Disposition': 'attachment; filename="banenplan_rapport.html"'}
+        headers={'Content-Disposition': 'attachment; filename="extractie_rapport.html"'}
     )
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
